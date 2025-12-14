@@ -74,15 +74,106 @@ DDL таблиц находится в: `sql/001_init.sql`
 5) **Сколько разных видео получали новые просмотры 27 ноября 2025?**  
    → `COUNT(DISTINCT video_id) FROM video_snapshots WHERE created_at in day AND delta_views_count > 0`
 
----
+Запуск (Docker)
+Шаг 1. Перейти в папку проекта
 
-## Запуск (Docker)
+Открой терминал и перейди в папку:
 
-### 1) Создать файл `.env`
+tg-video-analytics-bot
 
-В папке проекта:
+(если ты в корне репозитория, то просто открой папку tg-video-analytics-bot в IDE или перейди в неё командой cd)
 
-```bash
-cp .env.example .env
+Шаг 2. Создать файл .env
 
+В папке tg-video-analytics-bot рядом с .env.example нужно создать файл .env.
+
+Самый простой способ:
+
+скопируй файл .env.example
+
+вставь рядом
+
+переименуй копию в .env
+
+Дальше открой .env и обязательно укажи минимум:
+
+BOT_TOKEN=... (токен от @BotFather)
+
+Остальные переменные можно оставить как в .env.example.
+
+Важно: файл .env не должен попадать в публичный репозиторий.
+
+Шаг 3. Поднять контейнеры (PostgreSQL + бот)
+
+Запусти сборку и старт контейнеров командой:
+
+docker compose up -d --build
+
+Проверить, что контейнеры поднялись:
+
+docker compose ps
+
+Шаг 4. Проверить, что таблицы созданы
+
+Схема БД создаётся автоматически при старте Postgres (см. файл sql/001_init.sql).
+
+Проверка таблиц:
+
+docker compose exec db psql -U postgres -d video_analytics -c "\dt"
+
+Должны быть таблицы: videos, video_snapshots.
+
+Импорт данных из JSON
+Шаг 1. Скачать JSON
+
+Скачай файл videos.json (из задания) и положи его, например, сюда:
+
+C:\data\videos.json
+
+(путь может быть любой, главное — чтобы ты его знал)
+
+Шаг 2. Запустить импорт
+
+Команда запускается на хосте (на твоём компьютере), из папки tg-video-analytics-bot.
+
+Пример для Windows:
+
+python .\scripts\load_json.py --dsn "postgresql://postgres:postgres@localhost:5432/video_analytics" --file "C:\data\videos.json"
+
+После выполнения скрипт выведет что-то вроде:
+
+Loaded videos from JSON: ...
+OK: import finished. Attempted insert: videos=..., snapshots=...
+
+Шаг 3. Проверить количество видео в базе
+
+docker compose exec db psql -U postgres -d video_analytics -c "SELECT COUNT(*) FROM videos;"
+
+Проверка работы бота
+
+Открой бота в Telegram и отправь запрос, например:
+
+Сколько всего видео есть в системе?
+
+Бот должен вернуть одно число.
+
+Автопроверка (служебный бот)
+
+Для автоматической проверки через @rlt_test_checker_bot отправь команду:
+
+/check @tbot_analytics_videos_viktor_bot https://github.com/KinzelVA/Tbot_test_analitic_videos
+
+Важно: во время проверки твой бот должен быть запущен и доступен.
+
+Примеры запросов
+
+Сколько всего видео есть в системе?
+
+Сколько видео набрало больше 100000 просмотров за всё время?
+
+На сколько просмотров в сумме выросли все видео 28 ноября 2025?
+
+Сколько разных видео получали новые просмотры 27 ноября 2025?
+
+Сколько видео у креатора с id <creator_id> вышло с 19 августа 2025 по 17 ноября 2025 включительно?
 
