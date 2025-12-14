@@ -52,6 +52,16 @@ def _parse_ru_range(text: str) -> tuple[date, date] | None:
 def build_sql(text: str) -> tuple[str, tuple]:
     t = (text or "").lower().strip()
 
+    # 0) "Сколько всего есть замеров статистики..., где просмотры за час стали меньше?"
+    # Это про video_snapshots и отрицательную дельту просмотров.
+    if (
+        ("замер" in t or "замеров" in t or "статистик" in t or "снапшот" in t or "snapshot" in t)
+        and ("отриц" in t or "стало меньше" in t or "уменьш" in t or "сниз" in t)
+        and ("просмотр" in t or "просмотров" in t)
+    ):
+        return "SELECT COUNT(*)::bigint FROM video_snapshots WHERE delta_views_count < 0", ()
+
+
     # 1) "Сколько всего видео есть в системе?"
     if "сколько" in t and "видео" in t and ("всего" in t or "в системе" in t):
         return "SELECT COUNT(*)::bigint FROM videos", ()
