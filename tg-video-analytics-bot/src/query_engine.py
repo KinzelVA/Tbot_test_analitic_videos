@@ -56,6 +56,28 @@ def build_sql(text: str) -> tuple[str, tuple]:
     if "сколько" in t and "видео" in t and ("всего" in t or "в системе" in t):
         return "SELECT COUNT(*)::bigint FROM videos", ()
 
+    # 2a) "Сколько видео у креатора с id ... набрали больше 10 000 просмотров по итоговой статистике?"
+    # Важно: считаем по итоговой таблице videos + фильтр creator_id
+    if (
+        "сколько" in t
+        and "видео" in t
+        and ("креатора" in t or "креатор" in t)
+        and "id" in t
+        and ("просмотр" in t or "просмотров" in t)
+        and re.search(r"(больше|более|свыше|превысил|превысило|выше)", t)
+    ):
+        mid = re.search(r"(?:id\s*[:=]?\s*)([0-9a-fA-F\-]{8,64})", t)
+        mthr = re.search(r"(больше|более|свыше|превысил[ао]?|выше)\s*([\d\s]+)", t)
+        if mid and mthr:
+            creator_raw = mid.group(1)
+            creator_id = creator_raw.replace("-", "").lower()  # на случай, если попадётся UUID-формат
+            thr = _parse_int(mthr.group(2))
+            return (
+                "SELECT COUNT(*)::bigint FROM videos WHERE creator_id = $1 AND views_count > $2",
+                (creator_id, thr),
+            )
+
+
     # 2) "Сколько видео набрало больше 100 000 просмотров за всё время?"
     if "видео" in t and ("просмотр" in t or "просмотров" in t) and re.search(r"(больше|более|свыше|превысил|превысило|выше)", t):
         m = re.search(r"(больше|более|свыше|превысил[ао]?|выше)\s*([\d\s]+)", t)
