@@ -219,6 +219,32 @@ def build_sql(text: str) -> Tuple[str, Tuple[Any, ...]]:
     Все ответы стараемся вернуть одним значением (fetchval), даже топы/списки.
     """
     t = _norm(text)
+    # 0.Y) В скольких разных календарных днях ноября 2025 креатор публиковал хотя бы одно видео?
+    # Пример: "Для креатора с id ... посчитай, в скольких разных календарных днях ноября 2025 года он публиковал хотя бы одно видео"
+    digits = re.sub(r"\D+", "", text or "")
+    m_creator = re.search(r"\b[0-9a-f]{32}\b", (text or "").lower())
+
+    if (
+            m_creator
+            and ("креатор" in t or "креатора" in t)
+            and ("скольк" in t)
+            and ("дн" in t)  # день/днях
+            and ("ноябр" in t)
+            and ("2025" in t or "2025" in digits)
+            and ("публик" in t or "опублик" in t or "выпуст" in t)
+    ):
+        creator_id = m_creator.group(0)
+        return (
+            """
+            SELECT COUNT(DISTINCT (video_created_at::date))::bigint
+            FROM videos
+            WHERE creator_id = $1
+              AND video_created_at >= '2025-11-01'::timestamptz
+              AND video_created_at <  '2025-12-01'::timestamptz
+            """,
+            (creator_id,),
+        )
+
     # 0) Суммарный рост просмотров креатора за интервал времени в конкретную дату (сумма delta_views_count)
     creator_id = _extract_creator_id_token(text)
     d = _parse_ru_date_dmy_gen(text)
