@@ -1,11 +1,15 @@
 import re
 import datetime as dt
 from typing import Any, Tuple, Optional
-
+from datetime import date, time
 
 # В БД у тебя дата публикации = video_created_at (ты сам показал \d videos)
 PUBLISHED_COL = "video_created_at"
 
+_RU_MONTHS_GEN = {
+    "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
+    "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
+}
 
 # Поддерживаем разные падежи русских месяцев: "июня", "июне", "июнь" и т.п.
 _MONTH_ALIASES = {
@@ -166,6 +170,48 @@ def _parse_ru_month_and_year(text: str) -> Optional[tuple[int, int]]:
 
     return month, year
 
+def _extract_creator_id_token(s: str) -> str | None:
+    s = (s or "").lower()
+    # uuid без дефисов (как в ТЗ) или с дефисами
+    m = re.search(r"\bid\s*([0-9a-f]{32})\b", s)
+    if m:
+        return m.group(1)
+    m = re.search(r"\bid\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b", s)
+    if m:
+        return m.group(1).replace("-", "")
+    return None
+
+def _parse_ru_date_dmy_gen(s: str) -> date | None:
+    s = (s or "").lower()
+    m = re.search(r"\b(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+(\d{4})\b", s)
+    if not m:
+        return None
+    d = int(m.group(1))
+    mon = _RU_MONTHS_GEN[m.group(2)]
+    y = int(m.group(3))
+    return date(y, mon, d)
+
+def _parse_hhmm(s: str) -> time | None:
+    m = re.search(r"\b(\d{1,2})\s*[:.]\s*(\d{2})\b", (s or ""))
+    if not m:
+        return None
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return None
+    return time(hh, mm)
+
+def _parse_time_range(s: str) -> tuple[time, time] | None:
+    s2 = (s or "").lower()
+    m = re.search(r"с\s*(\d{1,2}\s*[:.]\s*\d{2})\s*до\s*(\d{1,2}\s*[:.]\s*\d{2})", s2)
+    if not m:
+        return None
+    t1 = _parse_hhmm(m.group(1))
+    t2 = _parse_hhmm(m.group(2))
+    if not t1 or not t2:
+        return None
+    return (t1, t2)
+
 
 def build_sql(text: str) -> Tuple[str, Tuple[Any, ...]]:
     """
@@ -173,6 +219,27 @@ def build_sql(text: str) -> Tuple[str, Tuple[Any, ...]]:
     Все ответы стараемся вернуть одним значением (fetchval), даже топы/списки.
     """
     t = _norm(text)
+    # 0) Суммарный рост просмотров креатора за интервал времени в конкретную дату (сумма delta_views_count)
+    creator_id = _extract_creator_id_token(text)
+    d = _parse_ru_date_dmy_gen(text)
+    tr = _parse_time_range(text)
+
+    if creator_id and d and tr and ("просмотр" in t) and (
+            ("вырос" in t) or ("суммар" in t) or ("на сколько" in t) or ("насколько" in t)) and ("с " in t) and (
+            " до " in t):
+        t_from, t_to = tr
+        return (
+            """
+            SELECT COALESCE(SUM(s.delta_views_count), 0)::bigint
+            FROM video_snapshots s
+            JOIN videos v ON v.id = s.video_id
+            WHERE v.creator_id = $1
+              AND s.created_at::date = $2::date
+              AND s.created_at::time >= $3::time
+              AND s.created_at::time <= $4::time
+            """,
+            (creator_id, d, t_from, t_to),
+        )
 
     # 1) Сколько всего видео в системе?
     if (
