@@ -241,6 +241,27 @@ def build_sql(text: str) -> Tuple[str, Tuple[Any, ...]]:
             (creator_id, d, t_from, t_to),
         )
 
+    # 0.X) Сколько разных креаторов имеют хотя бы одно видео с итоговыми просмотрами > 100000?
+    digits = re.sub(r"\D+", "", text or "")
+    if (
+            ("креатор" in t or "креаторов" in t)
+            and ("сколько" in t)
+            and ("разн" in t or "различ" in t)
+            and ("хотя бы" in t or "хотябы" in t)
+            and ("видео" in t)
+            and ("просмотр" in t)
+            and ("в итоге" in t or "итог" in t)
+            and ("100000" in digits)
+    ):
+        return (
+            """
+            SELECT COUNT(DISTINCT creator_id)::bigint
+            FROM videos
+            WHERE views_count > 100000
+            """,
+            (),
+        )
+
     # 1) Сколько всего видео в системе?
     if (
             ("видео" in t)
