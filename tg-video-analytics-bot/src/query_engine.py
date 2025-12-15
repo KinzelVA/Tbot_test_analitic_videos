@@ -4,11 +4,22 @@ import re
 from datetime import date, datetime
 from typing import Tuple, Optional
 
+
 _CREATOR_ID_RE = re.compile(r"\b[0-9a-f]{32}\b", re.IGNORECASE)
 
 _RU_MONTHS = {
-    "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
-    "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
+    "января": 1,
+    "февраля": 2,
+    "марта": 3,
+    "апреля": 4,
+    "мая": 5,
+    "июня": 6,
+    "июля": 7,
+    "августа": 8,
+    "сентября": 9,
+    "октября": 10,
+    "ноября": 11,
+    "декабря": 12,
 }
 
 
@@ -46,9 +57,11 @@ def _parse_ru_date_fragment(fragment: str) -> Optional[date]:
     )
     if not m:
         return None
+
     d = int(m.group(1))
     month = _RU_MONTHS[m.group(2)]
     y = int(m.group(3))
+
     try:
         return date(y, month, d)
     except Exception:
@@ -56,15 +69,17 @@ def _parse_ru_date_fragment(fragment: str) -> Optional[date]:
 
 
 def _extract_two_dates(t: str) -> Optional[Tuple[date, date]]:
+    # 1) ISO: 2025-11-01
     iso = re.findall(r"\b\d{4}-\d{2}-\d{2}\b", t)
     dates: list[date] = []
     for s in iso:
         d = _parse_iso_date(s)
         if d:
             dates.append(d)
-    if len(dates) >= 2:
-        return dates[0], dates[1]
+        if len(dates) >= 2:
+            return dates[0], dates[1]
 
+    # 2) RU: 1 ноября 2025
     ru_matches = re.findall(
         r"\b\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4}\b",
         t,
@@ -73,8 +88,8 @@ def _extract_two_dates(t: str) -> Optional[Tuple[date, date]]:
         d = _parse_ru_date_fragment(s)
         if d:
             dates.append(d)
-    if len(dates) >= 2:
-        return dates[0], dates[1]
+        if len(dates) >= 2:
+            return dates[0], dates[1]
 
     return None
 
@@ -94,24 +109,28 @@ def build_sql(text: str) -> Tuple[str, tuple]:
     # -----------------------------
     # A) Video snapshots (замеры / снимки)
     # -----------------------------
-    if ("замер" in t or "снимок" in t or "snapshot" in t) and ("просмотр" in t or "views" in t) and (
-        "отриц" in t or "меньше" in t or "уменьш" in t or "стало меньше" in t
+    if (
+        ("замер" in t or "снимок" in t or "snapshot" in t)
+        and ("просмотр" in t or "views" in t)
+        and ("отриц" in t or "меньше" in t or "уменьш" in t or "стало меньше" in t)
     ):
         return ("SELECT COUNT(*)::bigint FROM video_snapshots WHERE delta_views_count < 0", ())
 
-    if ("замер" in t or "замеров" in t or "снимок" in t or "снимков" in t or "snapshot" in t) and "статистик" in t:
+    if (
+        ("замер" in t or "замеров" in t or "снимок" in t or "снимков" in t or "snapshot" in t)
+        and "статистик" in t
+    ):
         return ("SELECT COUNT(*)::bigint FROM video_snapshots", ())
 
     # -----------------------------
     # B) Non-count answers (text responses)
     # -----------------------------
-    if ("самая ранняя" in t or "ранняя" in t) and ("самая поздняя" in t or "поздняя" in t) and (
-        "дата" in t or "число" in t
-    ):
+    if ("самая ранняя" in t or "ранняя" in t) and ("самая поздняя" in t or "поздняя" in t) and ("дата" in t or "число" in t):
         return (
             """
             SELECT
-              to_char(MIN(video_created_at)::date, 'YYYY-MM-DD') || ' ' ||
+              to_char(MIN(video_created_at)::date, 'YYYY-MM-DD')
+              || ' ' ||
               to_char(MAX(video_created_at)::date, 'YYYY-MM-DD')
             FROM videos
             """,
@@ -146,7 +165,27 @@ def build_sql(text: str) -> Tuple[str, tuple]:
         )
 
     # -----------------------------
-    # C) Videos — counts
+    # C) Date-range queries (ВАЖНО: ДОЛЖНЫ БЫТЬ ВЫШЕ, ЧЕМ "просто видео у креатора")
+    # -----------------------------
+    if creator_id and ("вышло" in t or "опублик" in t) and ("в период" in t or ("с" in t and "по" in t)):
+        rng = _extract_two_dates(t)
+        if rng:
+            d1, d2 = rng
+            # Важно: фильтруем именно по дате публикации видео (video_created_at)
+            return (
+                """
+                SELECT COUNT(*)::bigint
+                FROM videos
+                WHERE creator_id = $1
+                  AND video_created_at::date >= $2
+                  AND video_created_at::date <= $3
+                """,
+                (creator_id, d1, d2),
+            )
+        return ("SELECT 0::bigint", ())
+
+    # -----------------------------
+    # D) Videos — counts
     # -----------------------------
     if creator_id and "видео" in t and ("просмотр" in t) and ("больше" in t or "свыше" in t or ">" in t):
         threshold = _extract_first_int(t_no_id) or 0
@@ -159,28 +198,11 @@ def build_sql(text: str) -> Tuple[str, tuple]:
         threshold = _extract_first_int(t) or 0
         return ("SELECT COUNT(*)::bigint FROM videos WHERE views_count > $1", (threshold,))
 
+    # ОБЩЕЕ "сколько видео у креатора" — ТОЛЬКО ПОСЛЕ date-range
     if creator_id and "видео" in t and ("у креатора" in t or "креатора" in t or "креатор" in t or "автор" in t):
         return ("SELECT COUNT(*)::bigint FROM videos WHERE creator_id = $1", (creator_id,))
 
     if ("сколько" in t or "всего" in t) and "видео" in t:
         return ("SELECT COUNT(*)::bigint FROM videos", ())
-
-    # -----------------------------
-    # D) Date-range queries (опционально)
-    # -----------------------------
-    if creator_id and ("вышло" in t or "опублик" in t) and "с" in t and "по" in t:
-        rng = _extract_two_dates(t)
-        if rng:
-            d1, d2 = rng
-            return (
-                """
-                SELECT COUNT(*)::bigint
-                FROM videos
-                WHERE creator_id = $1
-                  AND video_created_at::date >= $2
-                  AND video_created_at::date <= $3
-                """,
-                (creator_id, d1, d2),
-            )
 
     return ("SELECT 0::bigint", ())
