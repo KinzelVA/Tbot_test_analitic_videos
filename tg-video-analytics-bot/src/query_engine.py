@@ -1,208 +1,288 @@
+"""
+src/query_engine.py
+
+Rule-based NL -> SQL for the Telegram Video Analytics Bot.
+
+Важно: бот (main.py) обычно делает db.fetchval(...) и ожидает одно значение.
+Поэтому для "табличных" ответов (топ-5 креаторов и т.п.) мы возвращаем ОДНУ
+строку, собранную в SQL через string_agg.
+"""
+
 from __future__ import annotations
 
+import os
 import re
-from datetime import date, datetime
-from typing import Tuple, Optional
+from datetime import datetime, timedelta
+from typing import Optional, Tuple
 
 
-_CREATOR_ID_RE = re.compile(r"\b[0-9a-f]{32}\b", re.IGNORECASE)
+# ----------------------------
+# Config / helpers
+# ----------------------------
 
-_RU_MONTHS = {
-    "января": 1,
-    "февраля": 2,
-    "марта": 3,
-    "апреля": 4,
-    "мая": 5,
-    "июня": 6,
-    "июля": 7,
-    "августа": 8,
-    "сентября": 9,
-    "октября": 10,
-    "ноября": 11,
-    "декабря": 12,
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _safe_ident(name: str, default: str) -> str:
+    name = (name or "").strip()
+    return name if _IDENTIFIER_RE.match(name) else default
+
+
+# Реальная колонка даты публикации может отличаться в разных эталонах.
+# По умолчанию используем video_created_at (как в вашем init sql).
+PUBLISHED_AT_COL = _safe_ident(
+    os.getenv("PUBLISHED_AT_COL") or os.getenv("PUBLISHED_AT") or os.getenv("VIDEO_PUBLISHED_AT_COL") or "",
+    default="video_created_at",
+)
+
+
+# ----------------------------
+# RU date parsing
+# ----------------------------
+
+# Поддерживаем разные падежи:
+# "июня" (род.), "июне" (предл.), а также короткие варианты.
+_MONTHS = {
+    # January
+    "января": 1, "январе": 1, "янв": 1, "январь": 1,
+    # February
+    "февраля": 2, "феврале": 2, "фев": 2, "февраль": 2,
+    # March
+    "марта": 3, "марте": 3, "мар": 3, "март": 3,
+    # April
+    "апреля": 4, "апреле": 4, "апр": 4, "апрель": 4,
+    # May
+    "мая": 5, "мае": 5, "май": 5,
+    # June
+    "июня": 6, "июне": 6, "июн": 6, "июнь": 6,
+    # July
+    "июля": 7, "июле": 7, "июл": 7, "июль": 7,
+    # August
+    "августа": 8, "августе": 8, "авг": 8, "август": 8,
+    # September
+    "сентября": 9, "сентябре": 9, "сен": 9, "сент": 9, "сентябрь": 9,
+    # October
+    "октября": 10, "октябре": 10, "окт": 10, "октябрь": 10,
+    # November
+    "ноября": 11, "ноябре": 11, "ноя": 11, "ноябрь": 11,
+    # December
+    "декабря": 12, "декабре": 12, "дек": 12, "декабрь": 12,
 }
 
 
-def _norm(text: str) -> str:
-    return (text or "").lower().strip()
-
-
-def _extract_creator_id(t: str) -> Optional[str]:
-    m = _CREATOR_ID_RE.search(t)
-    return m.group(0).lower() if m else None
-
-
-def _extract_first_int(t: str) -> Optional[int]:
-    # supports "10 000", "100000", "1_000" etc.
-    m = re.search(r"(\d[\d\s_]{0,20})", t)
-    if not m:
-        return None
-    digits = re.sub(r"\D", "", m.group(1))
-    return int(digits) if digits else None
-
-
-def _parse_iso_date(s: str) -> Optional[date]:
-    try:
-        return datetime.strptime(s, "%Y-%m-%d").date()
-    except Exception:
+def _parse_ru_date_fragment(s: str) -> Optional[datetime]:
+    """
+    Парсит дату из фрагмента вида:
+      - "1 ноября 2025"
+      - "01 ноября 2025"
+      - "1 ноября" (год опционально → None)
+    Возвращает datetime(YYYY, MM, DD) или None.
+    """
+    if not s:
         return None
 
+    s = s.lower().strip()
+    # допускаем лишние слова вроде "года"
+    s = re.sub(r"\bг(ода)?\b", "", s).strip()
 
-def _parse_ru_date_fragment(fragment: str) -> Optional[date]:
-    m = re.search(
-        r"\b(\d{1,2})\s+"
-        r"(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+"
-        r"(\d{4})\b",
-        fragment,
-    )
+    m = re.search(r"(\d{1,2})\s+([а-яё\.]+)\s*(\d{4})?", s, flags=re.I)
     if not m:
         return None
 
-    d = int(m.group(1))
-    month = _RU_MONTHS[m.group(2)]
-    y = int(m.group(3))
+    day = int(m.group(1))
+    mon_word = m.group(2).strip(".").lower()
+    year_s = m.group(3)
 
+    month = _MONTHS.get(mon_word)
+    if not month:
+        return None
+
+    if not year_s:
+        # год не задан — в рамках ТЗ это обычно не встречается, вернем None
+        return None
+
+    year = int(year_s)
     try:
-        return date(y, month, d)
-    except Exception:
+        return datetime(year, month, day)
+    except ValueError:
         return None
 
 
-def _extract_two_dates(t: str) -> Optional[Tuple[date, date]]:
-    # 1) ISO: 2025-11-01
-    iso = re.findall(r"\b\d{4}-\d{2}-\d{2}\b", t)
-    dates: list[date] = []
-    for s in iso:
-        d = _parse_iso_date(s)
-        if d:
-            dates.append(d)
-        if len(dates) >= 2:
-            return dates[0], dates[1]
+def _parse_ru_range(text: str) -> Optional[Tuple[datetime, datetime]]:
+    """
+    Парсит диапазон вида:
+      "с 1 ноября 2025 по 5 ноября 2025 включительно"
+    Возвращает (start_inclusive, end_exclusive) либо None.
+    """
+    t = (text or "").lower()
 
-    # 2) RU: 1 ноября 2025
-    ru_matches = re.findall(
-        r"\b\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4}\b",
-        t,
-    )
-    for s in ru_matches:
-        d = _parse_ru_date_fragment(s)
-        if d:
-            dates.append(d)
-        if len(dates) >= 2:
-            return dates[0], dates[1]
+    m = re.search(r"с\s+(.+?)\s+по\s+(.+?)(?:\bвключительно\b|\?|$)", t)
+    if not m:
+        return None
 
-    return None
+    d1 = _parse_ru_date_fragment(m.group(1))
+    d2 = _parse_ru_date_fragment(m.group(2))
+    if not d1 or not d2:
+        return None
+
+    start = datetime(d1.year, d1.month, d1.day)
+    # "включительно" → делаем end_exclusive = следующий день после d2
+    end = datetime(d2.year, d2.month, d2.day) + timedelta(days=1)
+    if end <= start:
+        return None
+    return start, end
 
 
-def build_sql(text: str) -> Tuple[str, tuple]:
-    t = _norm(text)
-    if not t:
-        return ("SELECT 0::bigint", ())
+def _parse_ru_month_year(text: str) -> Optional[Tuple[datetime, datetime]]:
+    """
+    Парсит "в июне 2025 года" / "за июнь 2025" / "в июне 2025".
+    Возвращает (start_inclusive, end_exclusive) либо None.
+    """
+    t = (text or "").lower()
+    m = re.search(r"\b([а-яё\.]+)\s+(\d{4})\b", t)
+    if not m:
+        return None
 
-    creator_id = _extract_creator_id(t)
+    mon_word = m.group(1).strip(".").lower()
+    year = int(m.group(2))
 
-    # Ключевой фикс: чтобы "1061" из creator_id не считалось порогом просмотров
-    t_no_id = t
-    if creator_id:
-        t_no_id = t_no_id.replace(creator_id, " ")
+    month = _MONTHS.get(mon_word)
+    if not month:
+        return None
 
-    # -----------------------------
-    # A) Video snapshots (замеры / снимки)
-    # -----------------------------
-    if (
-        ("замер" in t or "снимок" in t or "snapshot" in t)
-        and ("просмотр" in t or "views" in t)
-        and ("отриц" in t or "меньше" in t or "уменьш" in t or "стало меньше" in t)
-    ):
-        return ("SELECT COUNT(*)::bigint FROM video_snapshots WHERE delta_views_count < 0", ())
+    start = datetime(year, month, 1)
+    # конец месяца: первый день следующего месяца
+    if month == 12:
+        end = datetime(year + 1, 1, 1)
+    else:
+        end = datetime(year, month + 1, 1)
+    return start, end
 
-    if (
-        ("замер" in t or "замеров" in t or "снимок" in t or "снимков" in t or "snapshot" in t)
-        and "статистик" in t
-    ):
-        return ("SELECT COUNT(*)::bigint FROM video_snapshots", ())
 
-    # -----------------------------
-    # B) Non-count answers (text responses)
-    # -----------------------------
-    if ("самая ранняя" in t or "ранняя" in t) and ("самая поздняя" in t or "поздняя" in t) and ("дата" in t or "число" in t):
-        return (
-            """
-            SELECT
-              to_char(MIN(video_created_at)::date, 'YYYY-MM-DD')
-              || ' ' ||
-              to_char(MAX(video_created_at)::date, 'YYYY-MM-DD')
-            FROM videos
-            """,
-            (),
-        )
+def _extract_creator_id(text: str) -> Optional[str]:
+    m = re.search(r"\b([0-9a-f]{32})\b", (text or "").lower())
+    return m.group(1) if m else None
 
-    if ("топ" in t) and ("креатор" in t or "креаторов" in t or "авторов" in t) and ("количеству" in t or "числу" in t) and "видео" in t:
-        return (
-            """
-            SELECT COALESCE(string_agg(creator_id || ' ' || cnt::bigint, E'\n'), '')
-            FROM (
-              SELECT creator_id, COUNT(*) AS cnt
-              FROM videos
-              GROUP BY creator_id
-              ORDER BY cnt DESC
-              LIMIT 5
-            ) t
-            """,
-            (),
-        )
 
-    if ("креатор" in t or "креатора" in t or "автор" in t) and ("больше всего" in t or "больше всех" in t) and "видео" in t:
-        return (
-            """
-            SELECT creator_id || ' ' || COUNT(*)::bigint
-            FROM videos
-            GROUP BY creator_id
-            ORDER BY COUNT(*) DESC
-            LIMIT 1
-            """,
-            (),
-        )
+def _extract_threshold(text: str, default: Optional[int] = None) -> Optional[int]:
+    m = re.search(r"(\d[\d\s_]{2,})", (text or ""))
+    if not m:
+        return default
+    raw = m.group(1).replace(" ", "").replace("_", "")
+    try:
+        return int(raw)
+    except ValueError:
+        return default
 
-    # -----------------------------
-    # C) Date-range queries (ВАЖНО: ДОЛЖНЫ БЫТЬ ВЫШЕ, ЧЕМ "просто видео у креатора")
-    # -----------------------------
-    if creator_id and ("вышло" in t or "опублик" in t) and ("в период" in t or ("с" in t and "по" in t)):
-        rng = _extract_two_dates(t)
-        if rng:
-            d1, d2 = rng
-            # Важно: фильтруем именно по дате публикации видео (video_created_at)
+
+# ----------------------------
+# Core: NL -> SQL
+# ----------------------------
+
+def build_sql(text: str) -> tuple[str, tuple]:
+    """
+    Возвращает (sql, args).
+    SQL должен выдавать ОДНО значение (одно поле одной строки),
+    чтобы main.py мог безопасно использовать fetchval().
+    """
+    t = (text or "").lower().strip()
+    pub_col = PUBLISHED_AT_COL
+
+    # 1) Замеры статистики (video_snapshots)
+    if ("замер" in t or "снапшот" in t or "snapshot" in t) and ("статист" in t or "статистика" in t):
+        if ("отриц" in t or "стало меньше" in t or "уменьш" in t or "сниз" in t) and ("просмотр" in t):
+            return "SELECT COUNT(*)::bigint FROM video_snapshots WHERE delta_views_count < 0", ()
+        return "SELECT COUNT(*)::bigint FROM video_snapshots", ()
+
+    # 2) Сколько всего видео в системе
+    if ("сколько" in t or "количество" in t) and ("видео" in t) and ("в системе" in t or "всего" in t) and ("креатор" not in t and "creator" not in t):
+        return "SELECT COUNT(*)::bigint FROM videos", ()
+
+    # 3) Сколько видео у креатора (всего)
+    if ("креатор" in t or "creator" in t) and ("сколько" in t or "количество" in t) and ("видео" in t) and ("больше" not in t):
+        creator_id = _extract_creator_id(t)
+        if creator_id:
+            return "SELECT COUNT(*)::bigint FROM videos WHERE creator_id = $1", (creator_id,)
+
+    # 4) Сколько видео у креатора набрали больше X просмотров (по итоговой статистике)
+    if ("креатор" in t or "creator" in t) and ("видео" in t) and ("больше" in t) and ("просмотр" in t):
+        creator_id = _extract_creator_id(t)
+        threshold = _extract_threshold(t, default=10000)
+        if creator_id and threshold is not None:
             return (
-                """
-                SELECT COUNT(*)::bigint
-                FROM videos
-                WHERE creator_id = $1
-                  AND video_created_at::date >= $2
-                  AND video_created_at::date <= $3
-                """,
-                (creator_id, d1, d2),
+                "SELECT COUNT(*)::bigint FROM videos WHERE creator_id = $1 AND views_count > $2",
+                (creator_id, threshold),
             )
-        return ("SELECT 0::bigint", ())
 
-    # -----------------------------
-    # D) Videos — counts
-    # -----------------------------
-    if creator_id and "видео" in t and ("просмотр" in t) and ("больше" in t or "свыше" in t or ">" in t):
-        threshold = _extract_first_int(t_no_id) or 0
+    # 5) Сколько всего видео набрали больше X просмотров (по итоговой статистике)
+    if ("видео" in t) and ("больше" in t) and ("просмотр" in t) and ("креатор" not in t and "creator" not in t):
+        threshold = _extract_threshold(t, default=100000)
+        return "SELECT COUNT(*)::bigint FROM videos WHERE views_count > $1", (threshold,)
+
+    # 6) Ранняя/поздняя дата публикации
+    if ("самая ранняя" in t or "ранняя" in t) and ("самая поздняя" in t or "поздняя" in t) and ("дата" in t) and ("публик" in t):
         return (
-            "SELECT COUNT(*)::bigint FROM videos WHERE creator_id = $1 AND views_count > $2",
-            (creator_id, threshold),
+            f"SELECT (MIN({pub_col})::date::text || ' ' || MAX({pub_col})::date::text) FROM videos",
+            (),
         )
 
-    if "видео" in t and ("просмотр" in t) and ("больше" in t or "свыше" in t or ">" in t):
-        threshold = _extract_first_int(t) or 0
-        return ("SELECT COUNT(*)::bigint FROM videos WHERE views_count > $1", (threshold,))
+    # 7) Какой креатор выпустил больше всего видео и сколько?
+    if ("какой" in t) and ("креатор" in t or "creator" in t) and ("больше всего" in t) and ("видео" in t):
+        return (
+            """
+            SELECT COALESCE((
+                SELECT (creator_id || ' ' || cnt::text)
+                FROM (
+                    SELECT creator_id, COUNT(*)::bigint AS cnt
+                    FROM videos
+                    GROUP BY creator_id
+                    ORDER BY cnt DESC
+                    LIMIT 1
+                ) s
+            ), '0')
+            """,
+            (),
+        )
 
-    # ОБЩЕЕ "сколько видео у креатора" — ТОЛЬКО ПОСЛЕ date-range
-    if creator_id and "видео" in t and ("у креатора" in t or "креатора" in t or "креатор" in t or "автор" in t):
-        return ("SELECT COUNT(*)::bigint FROM videos WHERE creator_id = $1", (creator_id,))
+    # 8) Топ-5 креаторов по количеству видео
+    if ("топ" in t or "top" in t) and ("креатор" in t or "creator" in t) and ("колич" in t) and ("видео" in t):
+        return (
+            """
+            SELECT COALESCE((
+                SELECT string_agg(creator_id || ' ' || cnt::text, E'\n' ORDER BY cnt DESC)
+                FROM (
+                    SELECT creator_id, COUNT(*)::bigint AS cnt
+                    FROM videos
+                    GROUP BY creator_id
+                    ORDER BY cnt DESC
+                    LIMIT 5
+                ) s
+            ), '0')
+            """,
+            (),
+        )
 
-    if ("сколько" in t or "всего" in t) and "видео" in t:
-        return ("SELECT COUNT(*)::bigint FROM videos", ())
+    # 9) Креатор: сколько видео в период с ... по ... включительно (дата публикации)
+    if ("креатор" in t or "creator" in t) and ("видео" in t) and ("период" in t or ("с " in t and " по " in t)):
+        creator_id = _extract_creator_id(t)
+        rng = _parse_ru_range(t)
+        if creator_id and rng:
+            start, end = rng
+            return (
+                f"SELECT COUNT(*)::bigint FROM videos WHERE creator_id = $1 AND {pub_col} >= $2 AND {pub_col} < $3",
+                (creator_id, start, end),
+            )
 
-    return ("SELECT 0::bigint", ())
+    # 10) Суммарные просмотры всех видео, опубликованных в <месяц> <год>
+    # Пример из проверки: "в июне 2025 года"
+    if ("суммар" in t or "сумма" in t) and ("просмотр" in t) and ("опублик" in t):
+        rng = _parse_ru_month_year(t)
+        if rng:
+            start, end = rng
+            return (
+                f"SELECT COALESCE(SUM(views_count), 0)::bigint FROM videos WHERE {pub_col} >= $1 AND {pub_col} < $2",
+                (start, end),
+            )
+
+    # неизвестное → строго число (чтобы не падать на int())
+    return "SELECT 0::bigint", ()
